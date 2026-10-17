@@ -1,29 +1,198 @@
+
 pipeline {
     agent any
 
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(
+            numToKeepStr: '10',
+            artifactNumToKeepStr: '5'
+        ))
+    }
+
+    environment {
+        GIT_URL       = 'https://github.com/vivekics/BG-Azure--devops.git'
+        GIT_BRANCH    = 'main'
+        DOCKER_USER   = 'f1805'
+        IMAGE_NAME    = 'bg-azure-devops'
+        REPORT_DIR    = 'security-reports'
+        CONTAINER_NAME = 'bg-azure-devops-app'
+        HOST_PORT      = '8081'
+        CONTAINER_PORT = '8080'
+    }
+
     stages {
 
-        stage('Clone Repository') {
+        stage('Checkout') {
             steps {
-                git branch: 'master',
-                    url: 'https://github.com/vivekics/hello-world.git'
+                deleteDir()
+
+                git branch: "${GIT_BRANCH}",
+                    url: "${GIT_URL}"
+
+                sh '''
+                    set -eu
+                    mkdir -p "$REPORT_DIR"
+                    echo "Repository checked out successfully"
+                    git log -1 --oneline
+                    ls -la
+                '''
             }
         }
 
-        stage('Maven Build') {
+        stage('Gitleaks Secret Scan') {
             steps {
-                sh 'mvn clean package'
+                script {
+                    int scanStatus = sh(
+                        returnStatus: true,
+                        script: '''
+                            set +e
+
+                            docker run --rm \
+                              -v "$WORKSPACE:/path" \
+                              zricethezav/gitleaks:latest \
+                              detect \
+                              --source=/path \
+                              --no-git \
+                              --redact \
+                              --report-format=json \
+                              --report-path=/path/security-reports/gitleaks-report.json \
+                              --exit-code=1
+                        '''
+                    )
+
+                    if (scanStatus == 0) {
+                        echo 'Gitleaks completed without findings.'
+                    } else {
+                        echo "Gitleaks returned status ${scanStatus}. Continuing; inspect the report and logs."
+                    }
+
+                    sh '''
+                        if [ ! -f "$REPORT_DIR/gitleaks-report.json" ]; then
+                            echo '[]' > "$REPORT_DIR/gitleaks-report.json"
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}"
+                    env.FULL_IMAGE = "${env.DOCKER_USER}/${env.IMAGE_NAME}:${env.IMAGE_TAG}"
+
+                    sh '''
+                        set -eu
+
+                        if [ ! -f Dockerfile ]; then
+                            echo "ERROR: Dockerfile not found in repository root."
+                            exit 1
+                        fi
+
+                        docker build --pull \
+                          -t "$FULL_IMAGE" \
+                          -t "$DOCKER_USER/$IMAGE_NAME:latest" \
+                          .
+                    '''
+                }
+            }
+        }
+
+        stage('Push Image to Docker Hub') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'docker-cred',
+                        usernameVariable: 'REGISTRY_USER',
+                        passwordVariable: 'REGISTRY_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        set +x
+
+                        echo "$REGISTRY_PASSWORD" | docker login \
+                          --username "$REGISTRY_USER" \
+                          --password-stdin
+
+                        docker push "$FULL_IMAGE"
+                        docker push "$DOCKER_USER/$IMAGE_NAME:latest"
+
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Application on Port 8081') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Checking Docker image..."
+                    docker image inspect "$FULL_IMAGE" >/dev/null
+
+                    echo "Removing previous application container if present..."
+                    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+                    echo "Deploying application..."
+                    docker run -d \
+                      --name "$CONTAINER_NAME" \
+                      --restart unless-stopped \
+                      -p "$HOST_PORT:$CONTAINER_PORT" \
+                      "$FULL_IMAGE"
+
+                    echo "Waiting for application startup..."
+                    sleep 10
+
+                    if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" != "true" ]; then
+                        echo "ERROR: Container is not running."
+                        docker logs "$CONTAINER_NAME" || true
+                        exit 1
+                    fi
+
+                    echo "Container status:"
+                    docker ps --filter "name=$CONTAINER_NAME"
+
+                    echo "Recent application logs:"
+                    docker logs --tail 50 "$CONTAINER_NAME"
+
+                    echo "Deployment completed."
+                '''
             }
         }
     }
 
     post {
+        always {
+            archiveArtifacts(
+                artifacts: 'security-reports/**',
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
+
+            sh '''
+                docker logout >/dev/null 2>&1 || true
+                echo "========== DISK USAGE =========="
+                df -h || true
+            '''
+        }
+
         success {
-            echo 'Build completed successfully!'
+            echo "Pipeline completed. Image: ${env.DOCKER_USER}/${env.IMAGE_NAME}:${env.BUILD_NUMBER}"
+            echo "Application container: ${env.CONTAINER_NAME}, host port: ${env.HOST_PORT}"
         }
 
         failure {
-            echo 'Build failed!'
+            echo 'Pipeline failed. Check the failed stage and application logs.'
+        }
+
+        cleanup {
+            sh '''
+                docker image prune -f >/dev/null 2>&1 || true
+            '''
         }
     }
 }
